@@ -1,0 +1,464 @@
+---
+title: "Movies_Recommendation_Engine"
+author: "S.Vijay"
+date: "29 September 2018"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+setwd("E:/Kaggle/Movies Dataset")
+
+library(data.table)
+library(dplyr)
+library(stringr)
+library(jsonlite)
+library(tidyverse)
+library(reshape)
+library(tm)
+library(RSentiment)
+library(wordcloud)
+library(ggplot2)
+library(corrplot)
+library(caret)
+library(randomForest)
+library(reshape2)
+library(recommenderlab)
+
+```
+
+```{r}
+movies = read.csv("movies_metadata.csv", stringsAsFactors = F)
+rating = read.csv("ratings_small.csv")
+```
+
+#### Summary of Dataset
+```{r}
+glimpse(movies)
+glimpse(rating)
+```
+
+### EDA
+#### Check for NA values
+```{r}
+colSums(is.na(movies))
+```
+
+#### Removing the NA values
+```{r}
+movies_df = na.omit(movies)
+```
+
+#### Final check for NA values
+```{r}
+colSums(is.na(movies_df))
+```
+
+#### Creating new dataframe for genre column in movies dataset which is in JSON format
+```{r}
+movies_df$genres = gsub("'","\"", movies_df$genres)
+
+genre_df = movies_df %>% filter(nchar(genres) > 2) %>% 
+                      mutate(js = lapply(genres, fromJSON)) %>% 
+                      unnest(js) %>% select(id, title, genre = name)
+
+genre_bud_rev = movies_df %>% select(id, budget, revenue)
+
+genre = merge(genre_df, genre_bud_rev, by.x = "id", by.y = "id", all.x = T)
+
+movie_genre = genre %>% filter(budget != 0 & revenue != 0)
+```
+
+#### Collabarative Filtering using Movie Genre
+```{r}
+m = cast(movie_genre, formula = title~genre)
+colfil = merge(m, movies_df, by.x = "title", by.y = "title", all.x = T)
+colfil_df = colfil[,c(1:21,23,29,31,36,37)]
+```
+
+#### EDA
+```{r}
+# Deriving Difference column
+movies_df$Difference = ifelse(movies_df$budget == 0 | movies_df$revenue == 0, 
+                              0, movies_df$revenue - movies_df$budget)
+
+# Deriving Profit percent column
+movies_df$profit_percent = ((movies_df$Difference*100)/movies_df$budget)
+
+movies_df$Result = ifelse(movies_df$profit_percent >= 80,"Block_Buster",
+                          ifelse(movies_df$profit_percent >= 50 & movies_df$profit_percent < 80, "Super_Hit",
+                                 ifelse(movies_df$profit_percent >= 30 & movies_df$profit_percent < 50, "Hit",
+                                        ifelse(movies_df$profit_percent > 0 & movies_df$profit_percent < 30, "Average_Hit",
+                                               ifelse(movies_df$profit_percent == 0, "Neutral","Flop")))))
+
+movies_df$Result = ifelse(is.na(movies_df$Result),"Neutral",movies_df$Result)
+
+# Converting character column to catagorical column
+movies_df$original_language = as.factor(movies_df$original_language)
+movies_df$original_title = as.factor(movies_df$original_title)
+movies_df$status = as.factor(movies_df$status)
+movies_df$Result = as.factor(movies_df$Result)
+
+# Sparating numeric and categorical column
+numeric_col <- movies_df[sapply(movies_df, is.numeric)]
+
+categorical_col <- movies_df[sapply(movies_df,is.factor)]
+
+```
+
+#### Correlation Analysis
+```{r}
+corr <- cor(movies_df[sapply(movies_df, is.numeric)])
+corrplot(corr,type = "upper",method = "number") # Plot correlation matrix
+corr[lower.tri(corr)] = 0
+corr <- corr-diag(nrow(corr))
+index <- which(abs(corr) > 0.7,arr.ind = T)
+df <- data.frame(rowname=rownames(index),colname=colnames(corr)[index[,2]],cor_value=corr[index])
+df
+```
+
+### Univariate Analysis on Categorical columns - Checking for distribution
+```{r}
+for(i in 1:ncol(categorical_col)){
+  g = plot(categorical_col[,i], main = paste("Bar plot of", names(categorical_col[i])), xlab = names(categorical_col[i]))
+}
+```
+
+
+### Univariate Analysis on Numeric columns - Checking for distribution & skewness
+```{r}
+for(i in 1:ncol(numeric_col)){
+  g = hist.default(numeric_col[,i], main = paste("Histogram of", names(numeric_col[i])), xlab = names(numeric_col[i]))
+}
+```
+
+#### Exploring the tagline column to gather information on most used tagwords
+```{r}
+
+# taking the tagline column and separating each words
+tagline = gsub("[^A-Za-z///]", " ", movies_df$tagline)
+
+# Creating the corpus for text mining
+corpus = Corpus(VectorSource(list(movies_df$tagline))) 
+
+# Removing punctuation from the corpus
+corpus = tm_map(corpus,removePunctuation)
+
+# Converting uppercase letters to lowecase
+corpus = tm_map(corpus,content_transformer(tolower))
+
+# Removing the unwanted whitespaces
+corpus = tm_map(corpus,stripWhitespace)
+
+# Removing the stopwords from the corpus
+corpus = tm_map(corpus,removeWords,stopwords("english"))
+
+# Finally creating the document term matrix for doing sentiment analysis
+dtm_tag = DocumentTermMatrix(VCorpus(VectorSource(corpus[1]$content)))
+
+freq_tag=colSums(as.matrix(dtm_tag))
+
+sent_tag=calculate_sentiment(names(freq_tag)) %>% cbind(as.data.frame(freq_tag))
+
+positive=sent_tag[sent_tag$sentiment=="Positive",]
+negative=sent_tag[sent_tag$sentiment=="Negative",]
+cat("Positive Sentiment:",sum(positive$freq_tag),"Negative Sentiment:",sum(negative$freq_tag),sep="\n")
+```
+
+#### Word cloud for positive and negative tagwords 
+```{r,warning=FALSE}
+#par(mfrow=c(1,2))
+wordcloud(positive$text,positive$freq_tag, min.freq=10,rot.per=0,vfont=c("sans serif","plain"))
+text(x=0.5, y=1.05, "Positive",col=brewer.pal(4, "Reds"))
+wordcloud(negative$text,negative$freq_tag, min.freq=7,rot.per=0,vfont=c("sans serif","plain"))
+text(x=0.5, y=1.05, "Negative",col=brewer.pal(4, "Reds"))
+```
+
+#### Which year has seen maximum release of movies?
+```{r}
+movies_df$release_date = as.Date(movies_df$release_date, format = "%d-%m-%Y")
+
+movies_df$Year=as.factor(format(movies_df$release_date,"%Y"))
+movies_df$Date=as.factor(format(movies_df$release_date,"%d"))
+movies_df$month=month.abb[(as.factor(format(movies_df$release_date,"%m")))]
+
+movies_df %>% group_by(month) %>% drop_na(month) %>% summarise(count=n()) %>% arrange(desc(month)) %>% ggplot(aes(reorder(month,count),count,fill=month))+geom_bar(stat="identity")+theme_classic()+theme(plot.title=element_text(size=14,face="italic",colour="red"),legend.position="none")+labs(x="",y="",title="Number of Movies Released per month")+coord_flip()+geom_label(aes(label=count))
+
+
+```
+
+#### Highest Budget& Revenue Movies
+
+```{r}
+movies_df %>% select(original_title,budget) %>% 
+              drop_na(original_title) %>% 
+              arrange(desc(budget)) %>% 
+              head(10) %>% 
+              ggplot(aes(reorder(original_title,budget), budget,fill=original_title)) + 
+              geom_bar(stat="identity") + theme_classic() +
+              theme(axis.text.x = element_text(angle=90), 
+                    plot.title=element_text(color="Red",face="italic"),
+                    legend.position="none") + scale_y_continuous(labels=scales::comma) + 
+              labs(x="",y="Total Budget in $",title="Most Expensive Movies -Top 10")
+```
+
+
+#### Highest Grossing Movies
+
+```{r}
+movies_df %>% select(original_title,revenue) %>% drop_na(original_title) %>% 
+              arrange(desc(revenue)) %>% 
+              head(10) %>% 
+              ggplot(aes(reorder(original_title,revenue),revenue,fill=original_title)) + 
+              geom_bar(stat="identity") + theme_classic() + 
+              theme(axis.text.x=element_text(angle=90),plot.title=element_text(color="Red",face="italic"),
+                    legend.position="none") + scale_y_continuous(limits=c(0,3000000000),
+                                                                 breaks=seq(0,3000000000,500000000),
+                                                                 labels=scales::comma) + 
+              labs(x="",y="Total Revenue in $",title="Highest Grossing Movies -Top 10")
+```
+
+
+#### Movies with Highest Popularity
+```{r}
+movies_df %>% group_by(original_title) %>% 
+              arrange(desc(popularity)) %>% 
+              head(10) %>% 
+              ggplot(aes(factor(original_title,levels=original_title),
+                         popularity,fill=original_title)) + 
+              geom_bar(stat="identity") + 
+              theme_classic() + 
+              theme(axis.text.x=element_text(angle=90,hjust=0.5),
+                    plot.title=element_text(hjust=0.5,size=15,color="red"),
+                    legend.position="none") + 
+              labs(x="Title",y="Rating",title="Popularity of Movies") + 
+              scale_x_discrete(labels=function(x) str_wrap(x,width=15))
+```
+
+#### Movies with Highest Votes
+```{r}
+movies_df %>% group_by(original_title) %>% arrange(desc(vote_count)) %>% head(10) %>% ggplot(aes(factor(original_title,levels=original_title),vote_count,fill=original_title))+geom_bar(stat="identity")+theme_classic()+theme(axis.text.x=element_text(angle=90,hjust=0.5),plot.title=element_text(hjust=0.5,size=15,color="red"),legend.position="none")+labs(x="Title",y="Vote Count",title="Vote Count of Movies")+scale_x_discrete(labels=function(x) str_wrap(x,width=15))
+```
+
+#### Predictive Model for Revenue of the movies
+
+```{r}
+# Preparing train and test data for model building
+mov_train = movies_df[sample(1:nrow(movies_df),0.8*nrow(movies_df)),]
+mov_test = movies_df[sample(1:nrow(movies_df),0.2*nrow(movies_df)),]
+
+
+revenue_model_1 = lm(revenue~budget, data = mov_train) # Model 1 with only budget
+
+revenue_model_2 = lm(revenue~budget+vote_count, data = mov_train) # Model 2 with budget and vote_count
+
+revenue_model_3 = lm(revenue~budget+Difference, data = mov_train) # Model 3 with budget and difference
+
+revenue_model_4 = lm(revenue~budget+vote_count+Difference, data = mov_train) # Model 4 with budget, vote_count and difference
+
+
+# Summaray of all the models to find which model performs well
+summary(revenue_model_1)
+summary(revenue_model_2)
+summary(revenue_model_3)
+summary(revenue_model_4)
+```
+
+#### Revenue Predictions
+```{r}
+mov_test$predicted_Result_1 = predict(revenue_model_1, mov_test %>% select(-revenue))
+mov_test$predicted_Result_2 = predict(revenue_model_2, mov_test %>% select(-revenue))
+mov_test$predicted_Result_3 = predict(revenue_model_3, mov_test %>% select(-revenue))
+mov_test$predicted_Result_4 = predict(revenue_model_4, mov_test %>% select(-revenue))
+```
+
+
+#### Checking the RMSE value for better performing model
+```{r}
+rmse_1 = sqrt(mean(mov_test$revenue - mov_test$predicted_Result_1)^2)
+
+rmse_2 = sqrt(mean(mov_test$revenue - mov_test$predicted_Result_2)^2)
+
+rmse_3 = sqrt(mean(mov_test$revenue - mov_test$predicted_Result_3)^2)
+
+rmse_4 = sqrt(mean(mov_test$revenue - mov_test$predicted_Result_4)^2)
+
+rmse = c(rmse_1,rmse_2,rmse_3,rmse_4)
+lm_model = c("revenue_model_1","revenue_model_2","revenue_model_3","revenue_model_4")
+
+rmse_df = data.frame(rmse, lm_model)
+
+rmse_df %>% arrange(rmse_df$rmse) %>% head(1) # Best performing model = revenue_model_3
+
+```
+
+#### Classification model for finding the result of the movies
+```{r}
+movies_df$profit_percent = ifelse(is.na(movies_df$profit_percent), 0,movies_df$profit_percent)
+
+data = movies_df %>% mutate_if(is.character, as.factor) # Converting character column to factor column 
+
+data$release_date = as.Date(data$release_date,format = "%d-%m-%Y") 
+
+data$release_date = ifelse(is.na(data$release_date), 1,data$release_date) # missing values in date column is treated as 1
+```
+
+
+#### Random Forest Classification Model
+```{r}
+# Test and train data
+rf_train = data[sample(1:nrow(data),0.7*nrow(data)),]
+rf_test = data[sample(1:nrow(data),0.3*nrow(data)),]
+
+mtry = round(sqrt(length(colnames(rf_train))-1)) # Sampling the columns of train data
+
+model_rf = randomForest(Result~., data = rf_train %>% select(-original_language,
+                                                             -original_title,
+                                                             -tagline,
+                                                             -title,
+                                                             -overview,
+                                                             -genres), 
+                        ntree = 100, mtry = mtry) # Model building
+
+rf_test$Predicted_Result_1 = predict(model_rf, rf_test) # Predicting the result
+
+cm = confusionMatrix(rf_test$Predicted_Result_1, rf_test$Result) # Checking the model performance
+cm
+cm$overall['Accuracy']*100
+
+```
+
+#### Collabrative filtering for Movie Genre
+```{r}
+MoviesUmayLIKE = function(x){
+if(length(Genre) == 1 & any(Genre %in% colnames(colfil_df))){
+  Recommended_Movies = colfil_df %>% filter(colfil_df[Genre] == 1) %>% arrange(-popularity) %>% head(10) %>%  
+                                select("title","popularity","budget","revenue")
+  }else if(length(Genre) == 2 & any(Genre %in% colnames(colfil_df))){
+    Recommended_Movies = colfil_df %>% filter(colfil_df[Genre][1] == 1 & colfil_df[Genre][2] == 1) %>% 
+      arrange(-popularity) %>% head(10) %>% select("title","popularity","budget","revenue")
+    }else if(length(Genre) == 3 & any(Genre %in% colnames(colfil_df))){
+      Recommended_Movies = colfil_df %>% filter(colfil_df[Genre][1] == 1 & colfil_df[Genre][2] == 1 & 
+                                                  colfil_df[Genre][3] == 1) %>% arrange(-popularity) %>% 
+        head(10) %>% select("title","popularity","budget","revenue")
+      }else if(length(Genre) == 4 & any(Genre %in% colnames(colfil_df))){
+        Recommended_Movies = colfil_df %>% filter(colfil_df[Genre][1] == 1 & colfil_df[Genre][2] == 1 & 
+                                                    colfil_df[Genre][3] == 1 & colfil_df[Genre][4] == 1) %>% 
+          arrange(-popularity) %>% head(10) %>% select("title","popularity","budget","revenue")
+        }else if(length(Genre) == 5 & any(Genre %in% colnames(colfil_df))){
+          Recommended_Movies = colfil_df %>% filter(colfil_df[Genre][1] == 1 & colfil_df[Genre][2] == 1 & 
+                                                      colfil_df[Genre][3] == 1 & colfil_df[Genre][4] == 1 & 
+                                                      colfil_df[Genre][5] == 1) %>% arrange(-popularity) %>% 
+            head(10) %>% select("title","popularity","budget","revenue")
+          }else{
+    print("Genre not found in our database")
+          }
+ return(Recommended_Movies)
+}
+```
+
+#### Getting input from the user to filter movies accordingly
+```{r}
+#n = as.integer(readline(prompt = "Enter the number of genre you want to filter not greater than 5: "))
+#Genre = c()
+#for (i in 1:n) {
+#  Genre[i] = readline(prompt = "Enter Movie genre: ")
+#  print(Genre)
+#}
+#MoviesUmayLIKE(Genre) # Function to get the output
+```
+
+#### Recommendation System
+```{r}
+length(unique(rating$userId)) # Totally 671 users
+length(unique(rating$movieId)) # Totally 9066 movies
+```
+
+#### User Based Collabrative Filtering
+```{r}
+# Creating the rating matrix with rows as uers and columns as movies
+ratings_matrix = as.matrix(dcast(data = rating, userId~movieId, value.var = "rating"))
+
+# We can now remove the user ids and convert ratings_matrix to real rating matrix
+ranking_matrix = as(ratings_matrix[,-1], 'realRatingMatrix')
+
+# Create Recommender Model.The parameters are UBCF and Cosine similarity. We take 10 nearest neighbours
+ubcf = Recommender(ranking_matrix, method = 'UBCF', param = list(method = 'Cosine', nn = 10))
+
+# Predicting the recommendation of 4th user
+result = predict(ubcf, ranking_matrix[4, ])
+
+# Top 5 movies recommended to 4th user
+movies_sugg = as((bestN(result, n=5)),"list")[[1]]
+
+# Output with movieid and title
+movies %>% filter(id %in% movies_sugg) %>% select(id,title)
+
+```
+
+#### Item Based Collabrative Filtering
+```{r}
+# Creating the rating matrix with rows as movies and columns as users
+ratings_matrix_1 = as.matrix(dcast(data = rating, movieId~userId, value.var = 'rating'))
+
+# We can now remove the movie ids and convert ratings_matrix to real rating matrix
+ranking_matrix_1 = as(ratings_matrix[,-1], 'realRatingMatrix')
+
+# Create Recommender Model.The parameters are IBCF and Cosine similarity. We take 10 nearest neighbours
+ibcf = Recommender(ranking_matrix_1, method = "IBCF", param = list(method = "Cosine", k = 10))
+
+# Predicting the recommendation of 4th user
+result_1 = predict(ibcf, ranking_matrix_1[4, ])
+
+# Top 5 movies recommended to 4th user
+movies_sugg_1 = as((bestN(result_1, n=5)), "list")[[1]]
+
+# Output with movieid and title
+movies %>% filter(movieId %in% movies_sugg_1) %>% select(movieId,title)
+
+```
+#### Evaluation of IBCF and UBCF model to find the best performing model
+```{r}
+# create evaluation scheme splitting taking 90% of the date for training and leaving 10% for validation or test
+u1 <- evaluationScheme(ranking_matrix, method="split", train=0.9, given=-1)
+u2 <- evaluationScheme(ranking_matrix, method="split", train=0.8, given=-1)
+u3 <- evaluationScheme(ranking_matrix, method="split", train=0.7, given=-1)
+
+i1 <- evaluationScheme(ranking_matrix_1, method="split", train=0.9, given=-1)
+i2 <- evaluationScheme(ranking_matrix_1, method="split", train=0.8, given=-1)
+i3 <- evaluationScheme(ranking_matrix_1, method="split", train=0.7, given=-1)
+
+# creation of recommender model based on ubcf
+Rec.ubcf_1 <- Recommender(getData(u1, "train"), "UBCF")
+Rec.ubcf_2 <- Recommender(getData(u2, "train"), "UBCF")
+Rec.ubcf_3 <- Recommender(getData(u3, "train"), "UBCF")
+
+# creation of recommender model based on ibcf for comparison
+Rec.ibcf_1 <- Recommender(getData(i1, "train"), "IBCF")
+Rec.ibcf_2 <- Recommender(getData(i2, "train"), "IBCF")
+Rec.ibcf_3 <- Recommender(getData(i3, "train"), "IBCF")
+
+# making predictions on the test data set
+p.ubcf_1 <- predict(Rec.ubcf_1, getData(u1, "known"), type="ratings")
+p.ubcf_2 <- predict(Rec.ubcf_2, getData(u2, "known"), type="ratings")
+p.ubcf_3 <- predict(Rec.ubcf_3, getData(u3, "known"), type="ratings")
+
+# making predictions on the test data set
+p.ibcf_1 <- predict(Rec.ibcf_1, getData(i1, "known"), type="ratings")
+p.ibcf_2 <- predict(Rec.ibcf_2, getData(i2, "known"), type="ratings")
+p.ibcf_3 <- predict(Rec.ibcf_3, getData(i3, "known"), type="ratings")
+
+# obtaining the error metrics for both approaches and comparing them
+error.ubcf_1<-calcPredictionAccuracy(p.ubcf_1, getData(u1, "unknown"))
+error.ubcf_2<-calcPredictionAccuracy(p.ubcf_2, getData(u2, "unknown"))
+error.ubcf_3<-calcPredictionAccuracy(p.ubcf_3, getData(u3, "unknown"))
+
+error.ibcf_1<-calcPredictionAccuracy(p.ibcf_1, getData(i1, "unknown"))
+error.ibcf_2<-calcPredictionAccuracy(p.ibcf_2, getData(i2, "unknown"))
+error.ibcf_3<-calcPredictionAccuracy(p.ibcf_3, getData(i3, "unknown"))
+error <- rbind(error.ubcf_1,error.ubcf_2,error.ubcf_3,error.ibcf_1,error.ibcf_2,error.ibcf_3)
+rownames(error) <- c("model_1_UBCF","model_2_UBCF","model_3_UBCF","model_1_IBCF","model_2_IBCF","model_3_IBCF")
+error
+```
+
